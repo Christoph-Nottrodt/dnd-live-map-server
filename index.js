@@ -10,24 +10,54 @@ import bcrypt from "bcrypt";
 
 const app = express();
 
-// ✅ Wichtig bei Render/Railway/Fly/NGINX: damit req.protocol korrekt ist (https)
+/**
+ * Behind Render/Proxy: needed for correct req.protocol (https) and secure cookies.
+ */
 app.set("trust proxy", 1);
 
-// ✅ CORS: online erstmal offen lassen (später kannst du einschränken)
-app.use(cors({ origin: true, credentials: true }));
+/**
+ * CORS:
+ * - In production: set CLIENT_ORIGIN to your Netlify URL (e.g. https://xyz.netlify.app)
+ * - In dev: allow localhost
+ */
+const CLIENT_ORIGIN =
+  process.env.CLIENT_ORIGIN ||
+  "http://localhost:5173"; // Vite default (adjust if needed)
+
+app.use(
+  cors({
+    origin: CLIENT_ORIGIN,
+    credentials: true,
+  })
+);
+
 app.use(express.json({ limit: "2mb" }));
 
 const server = http.createServer(app);
 
 const io = new Server(server, {
-  cors: { origin: true, methods: ["GET", "POST"], credentials: true },
+  cors: {
+    origin: CLIENT_ORIGIN,
+    methods: ["GET", "POST"],
+    credentials: true,
+  },
 });
 
-// ✅ PORT muss vom Hoster kommen können
+/**
+ * PORT must come from the host.
+ */
 const PORT = Number(process.env.PORT) || 3001;
 
-// ⚠️ Dein fixes Passwort (ok für private Runden, später besser per ENV)
-const DEFAULT_DM_PASSWORD = process.env.DM_PASSWORD || "LeckMich994!";
+/**
+ * DM password:
+ * Require ENV in production to avoid accidental weak default online.
+ */
+const DM_PASSWORD = process.env.DM_PASSWORD;
+if (!DM_PASSWORD) {
+  console.warn(
+    "WARNING: DM_PASSWORD is not set. DM login will not work until you set it in the environment."
+  );
+}
 
 /* =========================
    Upload Setup
@@ -38,13 +68,15 @@ const __dirname = path.dirname(__filename);
 const uploadsDir = path.join(__dirname, "uploads");
 if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
 
-// Static hosting der Uploads
-app.use("/uploads", express.static(uploadsDir));
+// Serve uploaded files
+app.use("/uploads", express.static(uploadsDir, { maxAge: "1h" }));
 
 const storage = multer.diskStorage({
   destination: (_, __, cb) => cb(null, uploadsDir),
   filename: (_, file, cb) => {
-    const safe = file.originalname.replace(/[^a-zA-Z0-9._-]/g, "_");
+    const safe = String(file.originalname || "file")
+      .replace(/[^a-zA-Z0-9._-]/g, "_")
+      .slice(0, 120);
     cb(null, `${Date.now()}_${safe}`);
   },
 });
@@ -54,18 +86,27 @@ const upload = multer({
   limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
 });
 
-// ✅ Upload-URL darf NICHT localhost sein -> dynamisch aus Host bauen
+/**
+ * Upload endpoint
+ * - Returns absolute URL based on request host
+ * - Works behind Render proxy thanks to trust proxy
+ */
 app.post("/upload", upload.single("file"), (req, res) => {
-  if (!req.file) return res.status(400).json({ ok: false, error: "NO_FILE" });
+  try {
+    if (!req.file) return res.status(400).json({ ok: false, error: "NO_FILE" });
 
-  const baseUrl = `${req.protocol}://${req.get("host")}`;
+    const baseUrl = `${req.protocol}://${req.get("host")}`;
 
-  res.json({
-    ok: true,
-    url: `${baseUrl}/uploads/${req.file.filename}`,
-    name: req.file.originalname,
-    size: req.file.size,
-  });
+    return res.json({
+      ok: true,
+      url: `${baseUrl}/uploads/${req.file.filename}`,
+      name: req.file.originalname,
+      size: req.file.size,
+    });
+  } catch (e) {
+    console.error("Upload error:", e);
+    return res.status(500).json({ ok: false, error: "UPLOAD_FAILED" });
+  }
 });
 
 /* =========================
@@ -101,6 +142,15 @@ function broadcastPatch(roomId, patch) {
   io.to(roomId).emit("state:patch", patch);
 }
 
+/**
+ * Create per-room password hash.
+ * If DM_PASSWORD missing -> set hash to null and block dm:login.
+ */
+function createDmPasswordHash() {
+  if (!DM_PASSWORD) return null;
+  return bcrypt.hashSync(String(DM_PASSWORD), 10);
+}
+
 /* =========================
    Socket
 ========================= */
@@ -116,7 +166,7 @@ io.on("connection", (socket) => {
       id: roomId,
       state: makeInitialState(),
       dmId: null,
-      dmPasswordHash: bcrypt.hashSync(DEFAULT_DM_PASSWORD, 8),
+      dmPasswordHash: createDmPasswordHash(),
     });
 
     cb?.({ ok: true, roomId });
@@ -124,27 +174,30 @@ io.on("connection", (socket) => {
 
   /* ===== ROOM JOIN ===== */
   socket.on("room:join", ({ roomId, name, imgUrl, color }, cb) => {
-    const room = rooms.get(roomId);
+    const room = rooms.get(String(roomId || "").toUpperCase());
     if (!room) return cb?.({ ok: false, error: "ROOM_NOT_FOUND" });
 
-    socket.join(roomId);
+    const rid = room.id;
+    socket.join(rid);
 
-    room.state.tokens[socket.id] = {
+    const token = {
       id: socket.id,
       kind: "player",
       ownerId: socket.id,
-      name: (name || "Player").slice(0, 24),
+      name: String(name || "Player").slice(0, 24),
       x: 200 + Math.random() * 200,
       y: 200 + Math.random() * 200,
-      imgUrl: (imgUrl || "").slice(0, 400),
-      color: (color || "").slice(0, 32),
+      imgUrl: String(imgUrl || "").slice(0, 400),
+      color: String(color || "").slice(0, 32),
     };
+
+    room.state.tokens[socket.id] = token;
 
     cb?.({ ok: true, state: room.state });
 
-    socket.to(roomId).emit("state:patch", {
+    socket.to(rid).emit("state:patch", {
       type: "token:upsert",
-      token: room.state.tokens[socket.id],
+      token,
     });
 
     socket.emit("state:patch", {
@@ -155,7 +208,7 @@ io.on("connection", (socket) => {
 
   /* ===== TOKEN MOVE ===== */
   socket.on("token:move", ({ roomId, x, y }, cb) => {
-    const room = rooms.get(roomId);
+    const room = rooms.get(String(roomId || "").toUpperCase());
     if (!room) return cb?.({ ok: false, error: "ROOM_NOT_FOUND" });
 
     const t = room.state.tokens[socket.id];
@@ -167,7 +220,7 @@ io.on("connection", (socket) => {
     t.x = nx;
     t.y = ny;
 
-    socket.to(roomId).emit("state:patch", {
+    socket.to(room.id).emit("state:patch", {
       type: "token:move",
       id: socket.id,
       x: nx,
@@ -179,7 +232,7 @@ io.on("connection", (socket) => {
 
   /* ===== ADD ENEMY (DM ONLY) ===== */
   socket.on("token:addEnemy", ({ roomId, name, imgUrl, x, y }, cb) => {
-    const room = rooms.get(roomId);
+    const room = rooms.get(String(roomId || "").toUpperCase());
     if (!room) return cb?.({ ok: false, error: "ROOM_NOT_FOUND" });
     if (room.dmId !== socket.id) return cb?.({ ok: false, error: "NOT_DM" });
 
@@ -191,22 +244,26 @@ io.on("connection", (socket) => {
     const token = {
       id,
       kind: "enemy",
-      name: (name || "Enemy").slice(0, 24),
+      name: String(name || "Enemy").slice(0, 24),
       x: nx,
       y: ny,
-      imgUrl: (imgUrl || "").slice(0, 400),
+      imgUrl: String(imgUrl || "").slice(0, 400),
     };
 
     room.state.tokens[id] = token;
 
-    io.to(roomId).emit("state:patch", { type: "token:upsert", token });
+    io.to(room.id).emit("state:patch", { type: "token:upsert", token });
     cb?.({ ok: true, token });
   });
 
   /* ===== DM LOGIN ===== */
   socket.on("dm:login", async ({ roomId, password }, cb) => {
-    const room = rooms.get(roomId);
+    const room = rooms.get(String(roomId || "").toUpperCase());
     if (!room) return cb?.({ ok: false, error: "ROOM_NOT_FOUND" });
+
+    if (!room.dmPasswordHash) {
+      return cb?.({ ok: false, error: "DM_PASSWORD_NOT_CONFIGURED" });
+    }
 
     const pw = String(password || "");
     const ok = await bcrypt.compare(pw, room.dmPasswordHash);
@@ -215,50 +272,54 @@ io.on("connection", (socket) => {
     room.dmId = socket.id;
     room.state.dmId = socket.id;
 
-    broadcastPatch(roomId, { type: "room:dm", dmId: socket.id });
+    broadcastPatch(room.id, { type: "room:dm", dmId: socket.id });
     cb?.({ ok: true });
   });
 
   /* ===== MAP SET (DM ONLY) ===== */
   socket.on("map:set", ({ roomId, url, width, height }, cb) => {
-    const room = rooms.get(roomId);
+    const room = rooms.get(String(roomId || "").toUpperCase());
     if (!room) return cb?.({ ok: false, error: "ROOM_NOT_FOUND" });
     if (room.dmId !== socket.id) return cb?.({ ok: false, error: "NOT_DM" });
 
+    const w = clamp(width, 200, 20000);
+    const h = clamp(height, 200, 20000);
+
     room.state.map = {
       url: String(url || "").slice(0, 800),
-      width: Number(width) || 2000,
-      height: Number(height) || 1400,
+      width: w,
+      height: h,
     };
 
-    broadcastPatch(roomId, { type: "map:set", map: room.state.map });
+    broadcastPatch(room.id, { type: "map:set", map: room.state.map });
     cb?.({ ok: true });
   });
 
   /* ===== EFFECT ADD (DM ONLY) ===== */
   socket.on("effect:add", ({ roomId, effect }, cb) => {
-    const room = rooms.get(roomId);
+    const room = rooms.get(String(roomId || "").toUpperCase());
     if (!room) return cb?.({ ok: false, error: "ROOM_NOT_FOUND" });
     if (room.dmId !== socket.id) return cb?.({ ok: false, error: "NOT_DM" });
 
-    const id = "effect_" + Date.now();
-    const e = { ...effect, id };
+    const id = `effect_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
+    const e = { ...(effect || {}), id };
 
     room.state.effects[id] = e;
-    broadcastPatch(roomId, { type: "effect:upsert", effect: e });
+    broadcastPatch(room.id, { type: "effect:upsert", effect: e });
 
     cb?.({ ok: true, effect: e });
   });
 
   /* ===== EFFECT REMOVE (DM ONLY) ===== */
   socket.on("effect:remove", ({ roomId, id }, cb) => {
-    const room = rooms.get(roomId);
+    const room = rooms.get(String(roomId || "").toUpperCase());
     if (!room) return cb?.({ ok: false, error: "ROOM_NOT_FOUND" });
     if (room.dmId !== socket.id) return cb?.({ ok: false, error: "NOT_DM" });
 
-    if (room.state.effects[id]) {
-      delete room.state.effects[id];
-      broadcastPatch(roomId, { type: "effect:remove", id });
+    const key = String(id || "");
+    if (room.state.effects[key]) {
+      delete room.state.effects[key];
+      broadcastPatch(room.id, { type: "effect:remove", id: key });
     }
 
     cb?.({ ok: true });
@@ -266,26 +327,30 @@ io.on("connection", (socket) => {
 
   /* ===== DISCONNECT ===== */
   socket.on("disconnect", () => {
-    for (const [roomId, room] of rooms.entries()) {
+    for (const room of rooms.values()) {
+      const rid = room.id;
+
       if (room.state?.tokens?.[socket.id]) {
         delete room.state.tokens[socket.id];
-        broadcastPatch(roomId, { type: "token:remove", id: socket.id });
+        broadcastPatch(rid, { type: "token:remove", id: socket.id });
       }
 
       if (room.dmId === socket.id) {
         room.dmId = null;
         room.state.dmId = null;
-        broadcastPatch(roomId, { type: "room:dm", dmId: null });
+        broadcastPatch(rid, { type: "room:dm", dmId: null });
       }
     }
   });
 });
 
+/* =========================
+   HTTP routes
+========================= */
 app.get("/health", (_, res) => res.json({ ok: true }));
-
-// Optional: Root route (damit Browser nicht "Cannot GET /" zeigt)
 app.get("/", (_, res) => res.send("OK"));
 
 server.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
+  console.log(`CORS origin: ${CLIENT_ORIGIN}`);
 });
