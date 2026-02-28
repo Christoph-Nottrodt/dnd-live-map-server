@@ -1,0 +1,14 @@
+D&D Live Map – Online Deployment
+Server + Client sind fertig lokal.
+Ich will jetzt online deployen mit:
+Render + Netlify
+
+Server:
+- Node + Express + Socket.IO
+- Upload via multer
+- DM Passwort via ENV
+- PORT via process.env
+
+Client:
+- Vite + React
+- nutzt VITE_SERVER_URL
