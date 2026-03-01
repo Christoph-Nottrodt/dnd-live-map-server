@@ -7,6 +7,7 @@ import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
 import bcrypt from "bcrypt";
+import "dotenv/config";
 
 const app = express();
 
@@ -20,9 +21,7 @@ app.set("trust proxy", 1);
  * - In production: set CLIENT_ORIGIN to your Netlify URL (e.g. https://xyz.netlify.app)
  * - In dev: allow localhost
  */
-const CLIENT_ORIGIN =
-  process.env.CLIENT_ORIGIN ||
-  "http://localhost:5173"; // Vite default (adjust if needed)
+const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || "http://localhost:5173";
 
 app.use(
   cors({
@@ -151,6 +150,16 @@ function createDmPasswordHash() {
   return bcrypt.hashSync(String(DM_PASSWORD), 10);
 }
 
+function makeEvent(payload) {
+  // Keep it loose & forward-compatible
+  const id = `ev_${Date.now()}_${Math.floor(Math.random() * 100000)}`;
+  return {
+    id,
+    at: Date.now(),
+    ...payload,
+  };
+}
+
 /* =========================
    Socket
 ========================= */
@@ -206,11 +215,44 @@ io.on("connection", (socket) => {
     });
   });
 
-  /* ===== TOKEN MOVE ===== */
-  socket.on("token:move", ({ roomId, x, y }, cb) => {
+  /* ===== TOKEN MOVE =====
+     - Player: can move only own token (no id needed)
+     - DM: can move enemy tokens by providing id
+  */
+  socket.on("token:move", ({ roomId, id, x, y }, cb) => {
     const room = rooms.get(String(roomId || "").toUpperCase());
     if (!room) return cb?.({ ok: false, error: "ROOM_NOT_FOUND" });
 
+    const rid = room.id;
+
+    // Default: self move
+    const targetId = String(id || socket.id);
+
+    // If moving someone else -> must be DM and must be enemy
+    if (targetId !== socket.id) {
+      if (room.dmId !== socket.id) return cb?.({ ok: false, error: "NOT_DM" });
+
+      const tOther = room.state.tokens[targetId];
+      if (!tOther) return cb?.({ ok: false, error: "TOKEN_NOT_FOUND" });
+      if (tOther.kind !== "enemy") return cb?.({ ok: false, error: "ONLY_ENEMY_MOVABLE" });
+
+      const nx = clamp(x, 0, room.state.map.width);
+      const ny = clamp(y, 0, room.state.map.height);
+
+      tOther.x = nx;
+      tOther.y = ny;
+
+      io.to(rid).emit("state:patch", {
+        type: "token:move",
+        id: targetId,
+        x: nx,
+        y: ny,
+      });
+
+      return cb?.({ ok: true });
+    }
+
+    // Self move
     const t = room.state.tokens[socket.id];
     if (!t) return cb?.({ ok: false, error: "TOKEN_NOT_FOUND" });
 
@@ -220,7 +262,7 @@ io.on("connection", (socket) => {
     t.x = nx;
     t.y = ny;
 
-    socket.to(room.id).emit("state:patch", {
+    socket.to(rid).emit("state:patch", {
       type: "token:move",
       id: socket.id,
       x: nx,
@@ -254,6 +296,21 @@ io.on("connection", (socket) => {
 
     io.to(room.id).emit("state:patch", { type: "token:upsert", token });
     cb?.({ ok: true, token });
+  });
+
+  /* ===== OPTIONAL: TOKEN REMOVE (DM ONLY) ===== */
+  socket.on("token:remove", ({ roomId, id }, cb) => {
+    const room = rooms.get(String(roomId || "").toUpperCase());
+    if (!room) return cb?.({ ok: false, error: "ROOM_NOT_FOUND" });
+    if (room.dmId !== socket.id) return cb?.({ ok: false, error: "NOT_DM" });
+
+    const key = String(id || "");
+    if (!key) return cb?.({ ok: false, error: "BAD_ID" });
+    if (!room.state.tokens[key]) return cb?.({ ok: false, error: "TOKEN_NOT_FOUND" });
+
+    delete room.state.tokens[key];
+    io.to(room.id).emit("state:patch", { type: "token:remove", id: key });
+    cb?.({ ok: true });
   });
 
   /* ===== DM LOGIN ===== */
@@ -323,6 +380,45 @@ io.on("connection", (socket) => {
     }
 
     cb?.({ ok: true });
+  });
+
+  /* ===== EVENT LOG (DM OR PLAYER) =====
+     - Server just broadcasts; client filters DM-only if needed.
+  */
+  socket.on("event:log", ({ roomId, ...payload }, cb) => {
+    const room = rooms.get(String(roomId || "").toUpperCase());
+    if (!room) return cb?.({ ok: false, error: "ROOM_NOT_FOUND" });
+
+    const ev = makeEvent({
+      ...payload,
+      by: socket.id,
+    });
+
+    io.to(room.id).emit("event:new", ev);
+    cb?.({ ok: true, event: ev });
+  });
+
+  /* ===== EVENT ATTACK (DM OR PLAYER) ===== */
+  socket.on("event:attack", ({ roomId, attackerId, targetId, text, visibility }, cb) => {
+    const room = rooms.get(String(roomId || "").toUpperCase());
+    if (!room) return cb?.({ ok: false, error: "ROOM_NOT_FOUND" });
+
+    const a = room.state.tokens?.[String(attackerId || "")];
+    const b = room.state.tokens?.[String(targetId || "")];
+
+    const ev = makeEvent({
+      type: "attack",
+      attackerId: String(attackerId || ""),
+      targetId: String(targetId || ""),
+      attackerName: a?.name,
+      targetName: b?.name,
+      text: String(text || "").slice(0, 240),
+      visibility: visibility === "DM" ? "DM" : "ALL",
+      by: socket.id,
+    });
+
+    io.to(room.id).emit("event:new", ev);
+    cb?.({ ok: true, event: ev });
   });
 
   /* ===== DISCONNECT ===== */
