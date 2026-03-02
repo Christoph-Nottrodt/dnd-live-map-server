@@ -7,20 +7,11 @@ import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
 import bcrypt from "bcrypt";
-import "dotenv/config";
 
 const app = express();
 
-/**
- * Behind Render/Proxy: needed for correct req.protocol (https) and secure cookies.
- */
 app.set("trust proxy", 1);
 
-/**
- * CORS:
- * - In production: set CLIENT_ORIGIN to your Netlify URL (e.g. https://xyz.netlify.app)
- * - In dev: allow localhost
- */
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || "http://localhost:5173";
 
 app.use(
@@ -42,15 +33,8 @@ const io = new Server(server, {
   },
 });
 
-/**
- * PORT must come from the host.
- */
 const PORT = Number(process.env.PORT) || 3001;
 
-/**
- * DM password:
- * Require ENV in production to avoid accidental weak default online.
- */
 const DM_PASSWORD = process.env.DM_PASSWORD;
 if (!DM_PASSWORD) {
   console.warn(
@@ -67,7 +51,6 @@ const __dirname = path.dirname(__filename);
 const uploadsDir = path.join(__dirname, "uploads");
 if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
 
-// Serve uploaded files
 app.use("/uploads", express.static(uploadsDir, { maxAge: "1h" }));
 
 const storage = multer.diskStorage({
@@ -82,20 +65,13 @@ const storage = multer.diskStorage({
 
 const upload = multer({
   storage,
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
+  limits: { fileSize: 10 * 1024 * 1024 },
 });
 
-/**
- * Upload endpoint
- * - Returns absolute URL based on request host
- * - Works behind Render proxy thanks to trust proxy
- */
 app.post("/upload", upload.single("file"), (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ ok: false, error: "NO_FILE" });
-
     const baseUrl = `${req.protocol}://${req.get("host")}`;
-
     return res.json({
       ok: true,
       url: `${baseUrl}/uploads/${req.file.filename}`,
@@ -128,6 +104,9 @@ function makeInitialState() {
     tokens: {},
     effects: {},
     dmId: null,
+
+    // attacks[attackerId] = { attackerId, targetId, at }
+    attacks: {},
   };
 }
 
@@ -137,27 +116,67 @@ function clamp(n, min, max) {
   return Math.max(min, Math.min(v, max));
 }
 
+function clampInt(n, min, max) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return min;
+  const iv = Math.trunc(v);
+  return Math.max(min, Math.min(iv, max));
+}
+
 function broadcastPatch(roomId, patch) {
   io.to(roomId).emit("state:patch", patch);
 }
 
-/**
- * Create per-room password hash.
- * If DM_PASSWORD missing -> set hash to null and block dm:login.
- */
 function createDmPasswordHash() {
   if (!DM_PASSWORD) return null;
   return bcrypt.hashSync(String(DM_PASSWORD), 10);
 }
 
-function makeEvent(payload) {
-  // Keep it loose & forward-compatible
-  const id = `ev_${Date.now()}_${Math.floor(Math.random() * 100000)}`;
+/* =========================
+   Event Log (in-memory)
+   (legacy / optional)
+========================= */
+function makeEvent(type, payload = {}) {
   return {
-    id,
+    id: `ev_${Date.now()}_${Math.floor(Math.random() * 10000)}`,
     at: Date.now(),
+    type,
+    visibility: payload.visibility === "DM" ? "DM" : "ALL",
     ...payload,
   };
+}
+
+function pushRoomEvent(room, ev) {
+  if (!room.events) room.events = [];
+  room.events.push(ev);
+
+  const MAX = 300;
+  if (room.events.length > MAX) room.events = room.events.slice(-MAX);
+}
+
+/* =========================
+   Attacks helpers
+========================= */
+function ensureAttacks(room) {
+  if (!room.state.attacks || typeof room.state.attacks !== "object") room.state.attacks = {};
+}
+
+function clearAttacksInvolvingToken(room, tokenId) {
+  ensureAttacks(room);
+  const attacks = room.state.attacks;
+
+  const removedAttackerIds = [];
+  for (const [attackerId, a] of Object.entries(attacks)) {
+    if (!a) continue;
+    if (attackerId === tokenId || a.attackerId === tokenId || a.targetId === tokenId) {
+      delete attacks[attackerId];
+      removedAttackerIds.push(attackerId);
+    }
+  }
+
+  for (const attackerId of removedAttackerIds) {
+    broadcastPatch(room.id, { type: "attack:clear", attackerId });
+  }
 }
 
 /* =========================
@@ -166,7 +185,6 @@ function makeEvent(payload) {
 io.on("connection", (socket) => {
   console.log("Connected:", socket.id);
 
-  /* ===== ROOM CREATE ===== */
   socket.on("room:create", (_, cb) => {
     let roomId = makeRoomId();
     while (rooms.has(roomId)) roomId = makeRoomId();
@@ -176,12 +194,12 @@ io.on("connection", (socket) => {
       state: makeInitialState(),
       dmId: null,
       dmPasswordHash: createDmPasswordHash(),
+      events: [],
     });
 
     cb?.({ ok: true, roomId });
   });
 
-  /* ===== ROOM JOIN ===== */
   socket.on("room:join", ({ roomId, name, imgUrl, color }, cb) => {
     const room = rooms.get(String(roomId || "").toUpperCase());
     if (!room) return cb?.({ ok: false, error: "ROOM_NOT_FOUND" });
@@ -202,59 +220,36 @@ io.on("connection", (socket) => {
 
     room.state.tokens[socket.id] = token;
 
+    // state enthält map/tokens/effects/dmId/attacks
     cb?.({ ok: true, state: room.state });
 
-    socket.to(rid).emit("state:patch", {
-      type: "token:upsert",
-      token,
-    });
-
-    socket.emit("state:patch", {
-      type: "room:dm",
-      dmId: room.dmId,
-    });
+    socket.to(rid).emit("state:patch", { type: "token:upsert", token });
+    socket.emit("state:patch", { type: "room:dm", dmId: room.dmId });
   });
 
-  /* ===== TOKEN MOVE =====
-     - Player: can move only own token (no id needed)
-     - DM: can move enemy tokens by providing id
-  */
+  /* ===== EVENT HISTORY (optional legacy) ===== */
+  socket.on("event:history", ({ roomId, limit }, cb) => {
+    const room = rooms.get(String(roomId || "").toUpperCase());
+    if (!room) return cb?.({ ok: false, error: "ROOM_NOT_FOUND" });
+
+    const n = clampInt(limit ?? 120, 1, 300);
+    const events = Array.isArray(room.events) ? room.events.slice(-n) : [];
+
+    cb?.({ ok: true, events });
+  });
+
+  /* ===== TOKEN MOVE ===== */
   socket.on("token:move", ({ roomId, id, x, y }, cb) => {
     const room = rooms.get(String(roomId || "").toUpperCase());
     if (!room) return cb?.({ ok: false, error: "ROOM_NOT_FOUND" });
 
-    const rid = room.id;
-
-    // Default: self move
     const targetId = String(id || socket.id);
-
-    // If moving someone else -> must be DM and must be enemy
-    if (targetId !== socket.id) {
-      if (room.dmId !== socket.id) return cb?.({ ok: false, error: "NOT_DM" });
-
-      const tOther = room.state.tokens[targetId];
-      if (!tOther) return cb?.({ ok: false, error: "TOKEN_NOT_FOUND" });
-      if (tOther.kind !== "enemy") return cb?.({ ok: false, error: "ONLY_ENEMY_MOVABLE" });
-
-      const nx = clamp(x, 0, room.state.map.width);
-      const ny = clamp(y, 0, room.state.map.height);
-
-      tOther.x = nx;
-      tOther.y = ny;
-
-      io.to(rid).emit("state:patch", {
-        type: "token:move",
-        id: targetId,
-        x: nx,
-        y: ny,
-      });
-
-      return cb?.({ ok: true });
-    }
-
-    // Self move
-    const t = room.state.tokens[socket.id];
+    const t = room.state.tokens[targetId];
     if (!t) return cb?.({ ok: false, error: "TOKEN_NOT_FOUND" });
+
+    if (targetId !== socket.id && room.dmId !== socket.id) {
+      return cb?.({ ok: false, error: "NOT_ALLOWED" });
+    }
 
     const nx = clamp(x, 0, room.state.map.width);
     const ny = clamp(y, 0, room.state.map.height);
@@ -262,9 +257,9 @@ io.on("connection", (socket) => {
     t.x = nx;
     t.y = ny;
 
-    socket.to(rid).emit("state:patch", {
+    io.to(room.id).emit("state:patch", {
       type: "token:move",
-      id: socket.id,
+      id: targetId,
       x: nx,
       y: ny,
     });
@@ -272,8 +267,8 @@ io.on("connection", (socket) => {
     cb?.({ ok: true });
   });
 
-  /* ===== ADD ENEMY (DM ONLY) ===== */
-  socket.on("token:addEnemy", ({ roomId, name, imgUrl, x, y }, cb) => {
+  /* ===== ENEMY ADD ===== */
+  socket.on("token:addEnemy", ({ roomId, name, imgUrl, x, y, hp }, cb) => {
     const room = rooms.get(String(roomId || "").toUpperCase());
     if (!room) return cb?.({ ok: false, error: "ROOM_NOT_FOUND" });
     if (room.dmId !== socket.id) return cb?.({ ok: false, error: "NOT_DM" });
@@ -290,6 +285,7 @@ io.on("connection", (socket) => {
       x: nx,
       y: ny,
       imgUrl: String(imgUrl || "").slice(0, 400),
+      hp: clampInt(hp ?? 0, 0, 9999),
     };
 
     room.state.tokens[id] = token;
@@ -298,18 +294,88 @@ io.on("connection", (socket) => {
     cb?.({ ok: true, token });
   });
 
-  /* ===== OPTIONAL: TOKEN REMOVE (DM ONLY) ===== */
-  socket.on("token:remove", ({ roomId, id }, cb) => {
+  /* ===== ENEMY REMOVE ===== */
+  socket.on("token:removeEnemy", ({ roomId, id }, cb) => {
     const room = rooms.get(String(roomId || "").toUpperCase());
     if (!room) return cb?.({ ok: false, error: "ROOM_NOT_FOUND" });
     if (room.dmId !== socket.id) return cb?.({ ok: false, error: "NOT_DM" });
 
-    const key = String(id || "");
-    if (!key) return cb?.({ ok: false, error: "BAD_ID" });
-    if (!room.state.tokens[key]) return cb?.({ ok: false, error: "TOKEN_NOT_FOUND" });
+    const tid = String(id || "");
+    const t = room.state.tokens[tid];
+    if (!t) return cb?.({ ok: false, error: "TOKEN_NOT_FOUND" });
+    if (t.kind !== "enemy") return cb?.({ ok: false, error: "NOT_ENEMY" });
 
-    delete room.state.tokens[key];
-    io.to(room.id).emit("state:patch", { type: "token:remove", id: key });
+    delete room.state.tokens[tid];
+    broadcastPatch(room.id, { type: "token:remove", id: tid });
+
+    clearAttacksInvolvingToken(room, tid);
+
+    cb?.({ ok: true });
+  });
+
+  /* ===== ENEMY HP UPDATE ===== */
+  socket.on("token:setHp", ({ roomId, id, hp }, cb) => {
+    const room = rooms.get(String(roomId || "").toUpperCase());
+    if (!room) return cb?.({ ok: false, error: "ROOM_NOT_FOUND" });
+    if (room.dmId !== socket.id) return cb?.({ ok: false, error: "NOT_DM" });
+
+    const tid = String(id || "");
+    const t = room.state.tokens[tid];
+    if (!t) return cb?.({ ok: false, error: "TOKEN_NOT_FOUND" });
+    if (t.kind !== "enemy") return cb?.({ ok: false, error: "NOT_ENEMY" });
+
+    t.hp = clampInt(hp ?? 0, 0, 9999);
+
+    io.to(room.id).emit("state:patch", { type: "token:upsert", token: t });
+    cb?.({ ok: true, hp: t.hp });
+  });
+
+  /* ===== PERSISTENT ATTACK LINES ===== */
+  socket.on("attack:set", ({ roomId, attackerId, targetId }, cb) => {
+    const room = rooms.get(String(roomId || "").toUpperCase());
+    if (!room) return cb?.({ ok: false, error: "ROOM_NOT_FOUND" });
+
+    ensureAttacks(room);
+
+    const aId = String(attackerId || socket.id);
+    const tId = String(targetId || "");
+
+    const attacker = room.state.tokens[aId];
+    const target = room.state.tokens[tId];
+
+    if (!attacker) return cb?.({ ok: false, error: "ATTACKER_NOT_FOUND" });
+    if (!target) return cb?.({ ok: false, error: "TARGET_NOT_FOUND" });
+    if (aId === tId) return cb?.({ ok: false, error: "SAME_TOKEN" });
+
+    if (aId !== socket.id && room.dmId !== socket.id) {
+      return cb?.({ ok: false, error: "NOT_ALLOWED" });
+    }
+
+    const entry = { attackerId: aId, targetId: tId, at: Date.now() };
+    room.state.attacks[aId] = entry;
+
+    broadcastPatch(room.id, { type: "attack:set", attack: entry });
+
+    cb?.({ ok: true, attack: entry });
+  });
+
+  socket.on("attack:clear", ({ roomId, attackerId }, cb) => {
+    const room = rooms.get(String(roomId || "").toUpperCase());
+    if (!room) return cb?.({ ok: false, error: "ROOM_NOT_FOUND" });
+
+    ensureAttacks(room);
+
+    const aId = String(attackerId || socket.id);
+
+    if (aId !== socket.id && room.dmId !== socket.id) {
+      return cb?.({ ok: false, error: "NOT_ALLOWED" });
+    }
+
+    if (room.state.attacks[aId]) {
+      delete room.state.attacks[aId];
+      broadcastPatch(room.id, { type: "attack:clear", attackerId: aId });
+    }
+
     cb?.({ ok: true });
   });
 
@@ -326,6 +392,7 @@ io.on("connection", (socket) => {
     const ok = await bcrypt.compare(pw, room.dmPasswordHash);
     if (!ok) return cb?.({ ok: false, error: "WRONG_PASSWORD" });
 
+    // ✅ IMPORTANT: keep both fields in sync
     room.dmId = socket.id;
     room.state.dmId = socket.id;
 
@@ -333,7 +400,7 @@ io.on("connection", (socket) => {
     cb?.({ ok: true });
   });
 
-  /* ===== MAP SET (DM ONLY) ===== */
+  /* ===== MAP SET ===== */
   socket.on("map:set", ({ roomId, url, width, height }, cb) => {
     const room = rooms.get(String(roomId || "").toUpperCase());
     if (!room) return cb?.({ ok: false, error: "ROOM_NOT_FOUND" });
@@ -352,7 +419,7 @@ io.on("connection", (socket) => {
     cb?.({ ok: true });
   });
 
-  /* ===== EFFECT ADD (DM ONLY) ===== */
+  /* ===== EFFECTS ===== */
   socket.on("effect:add", ({ roomId, effect }, cb) => {
     const room = rooms.get(String(roomId || "").toUpperCase());
     if (!room) return cb?.({ ok: false, error: "ROOM_NOT_FOUND" });
@@ -367,7 +434,6 @@ io.on("connection", (socket) => {
     cb?.({ ok: true, effect: e });
   });
 
-  /* ===== EFFECT REMOVE (DM ONLY) ===== */
   socket.on("effect:remove", ({ roomId, id }, cb) => {
     const room = rooms.get(String(roomId || "").toUpperCase());
     if (!room) return cb?.({ ok: false, error: "ROOM_NOT_FOUND" });
@@ -382,43 +448,51 @@ io.on("connection", (socket) => {
     cb?.({ ok: true });
   });
 
-  /* ===== EVENT LOG (DM OR PLAYER) =====
-     - Server just broadcasts; client filters DM-only if needed.
-  */
-  socket.on("event:log", ({ roomId, ...payload }, cb) => {
+  /* ===== EVENTS (legacy) ===== */
+  socket.on("event:log", ({ roomId, type, title, text, visibility }, cb) => {
     const room = rooms.get(String(roomId || "").toUpperCase());
     if (!room) return cb?.({ ok: false, error: "ROOM_NOT_FOUND" });
 
-    const ev = makeEvent({
-      ...payload,
-      by: socket.id,
+    if (visibility === "DM" && room.dmId !== socket.id) {
+      return cb?.({ ok: false, error: "NOT_DM" });
+    }
+
+    const ev = makeEvent(String(type || "note"), {
+      title: String(title || "").slice(0, 60),
+      text: String(text || "").slice(0, 240),
+      visibility: visibility === "DM" ? "DM" : "ALL",
     });
 
+    pushRoomEvent(room, ev);
+
     io.to(room.id).emit("event:new", ev);
-    cb?.({ ok: true, event: ev });
+    cb?.({ ok: true });
   });
 
-  /* ===== EVENT ATTACK (DM OR PLAYER) ===== */
   socket.on("event:attack", ({ roomId, attackerId, targetId, text, visibility }, cb) => {
     const room = rooms.get(String(roomId || "").toUpperCase());
     if (!room) return cb?.({ ok: false, error: "ROOM_NOT_FOUND" });
 
-    const a = room.state.tokens?.[String(attackerId || "")];
-    const b = room.state.tokens?.[String(targetId || "")];
+    if (visibility === "DM" && room.dmId !== socket.id) {
+      return cb?.({ ok: false, error: "NOT_DM" });
+    }
 
-    const ev = makeEvent({
-      type: "attack",
-      attackerId: String(attackerId || ""),
-      targetId: String(targetId || ""),
+    const a = room.state.tokens[String(attackerId || "")];
+    const b = room.state.tokens[String(targetId || "")];
+
+    const ev = makeEvent("attack", {
+      attackerId,
+      targetId,
       attackerName: a?.name,
       targetName: b?.name,
       text: String(text || "").slice(0, 240),
       visibility: visibility === "DM" ? "DM" : "ALL",
-      by: socket.id,
     });
 
+    pushRoomEvent(room, ev);
+
     io.to(room.id).emit("event:new", ev);
-    cb?.({ ok: true, event: ev });
+    cb?.({ ok: true });
   });
 
   /* ===== DISCONNECT ===== */
@@ -429,6 +503,8 @@ io.on("connection", (socket) => {
       if (room.state?.tokens?.[socket.id]) {
         delete room.state.tokens[socket.id];
         broadcastPatch(rid, { type: "token:remove", id: socket.id });
+
+        clearAttacksInvolvingToken(room, socket.id);
       }
 
       if (room.dmId === socket.id) {
